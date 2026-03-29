@@ -33,5 +33,5 @@
 ```bash
 git clone https://github.com/your-team/invision-analyzer.git
 cd invision-analyzer
-pip install groq python-dotenv
+pip install groq python-dotenv "setuptools<70.0.0"
 pip install natasha  # опционально, для точной NER-анонимизации
