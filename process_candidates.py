@@ -3,6 +3,138 @@ import time
 import sys
 from include.main import CandidateAnalyzer
 
+def _bar(score: float, width: int = 18) -> str:
+    """Рендерит текстовый прогресс-бар для значения 0.0–1.0."""
+    if not isinstance(score, (int, float)):
+        return "?" * width
+    filled = max(0, min(width, round(float(score) * width)))
+    return "█" * filled + "░" * (width - filled)
+
+
+def _safe_get(d: dict, *keys, default="N/A"):
+    """Безопасно извлекает вложенное значение из словаря."""
+    for k in keys:
+        if not isinstance(d, dict):
+            return default
+        d = d.get(k, default)
+    return d
+
+
+def print_explainability_cards(results: list):
+    """Печатает детальную карточку explainability для каждого кандидата."""
+    SEP = "─" * 74
+
+    print(f"\n\n{'━' * 80}")
+    print(f"  🔍 ДЕТАЛЬНЫЙ РАЗБОР КАНДИДАТОВ (EXPLAINABILITY)")
+    print(f"{'━' * 80}")
+
+    for r in results:
+        cid = r["candidate_id"]
+        a   = r["analysis"]
+
+        print(f"\n  {SEP}")
+        print(f"  📋 {cid}")
+        print(f"  {SEP}")
+
+        if "error" in a:
+            print(f"  ⚠️  Анализ не выполнен: {a['error']}")
+            continue
+
+        s        = a.get("scores", {})
+        bd       = a.get("score_breakdown", {})
+        fi       = a.get("feature_impact", {})
+        ev       = a.get("evidence", {})
+        ai_l     = a.get("ai_risk_level", "Unknown")
+        ai_emoji = {"Low": "🟢", "Medium": "🟡", "High": "🔴"}.get(ai_l, "⚪")
+
+        lead = s.get("leadership") or 0.0
+        moti = s.get("motivation") or 0.0
+        grow = s.get("growth_path") or 0.0
+        ai_r = s.get("ai_risk") or 0.0
+
+        # ── Scores + bars + key factors ──────────────────────────────────
+        print(f"  SCORES")
+        for label, val, crit in [
+            ("Leadership", lead, "leadership"),
+            ("Motivation", moti, "motivation"),
+            ("Growth    ", grow, "growth_path"),
+        ]:
+            bar = _bar(val)
+            kf  = str(_safe_get(fi, crit, "key_factor"))[:32]
+            print(f"    {label}  {val:.2f}  {bar}  → {kf}")
+        print(f"    AI Risk    {ai_emoji} {ai_l} ({ai_r:.2f})")
+        # ── Local text features ──────────────────────────────────────────────
+        tf = a.get("text_features")
+        if tf:
+            print(f"\n  TEXT FEATURES  (локально, до LLM)")
+            wc   = tf.get("word_count", "?")
+            sc   = tf.get("sentence_count", "?")
+            asl  = tf.get("avg_sentence_len", "?")
+            ttr  = tf.get("type_token_ratio", "?")
+            aimc = tf.get("ai_marker_count", "?")
+            ivc  = tf.get("initiative_verb_count", "?")
+            nc   = tf.get("number_count", "?")
+            print(f"    Слов: {wc} | Предл: {sc} | Сред. длина: {asl} | TTR: {ttr}")
+            print(f"    ИИ-маркеры: {aimc} | Глаголы действия: {ivc} | Числа: {nc}")
+        # ── Per-criterion reasoning ───────────────────────────────────────
+        print(f"\n  REASONING")
+        for label, crit in [
+            ("Leadership", "leadership"),
+            ("Motivation", "motivation"),
+            ("Growth    ", "growth_path"),
+        ]:
+            text = str(_safe_get(bd, crit, "reasoning"))
+            text = text[:65] + "..." if len(text) > 65 else text
+            print(f"    {label}: {text}")
+
+        # ── Feature weights ───────────────────────────────────────────────
+        w_lead = _safe_get(fi, "leadership",  "weight_pct", default=0)
+        w_moti = _safe_get(fi, "motivation",  "weight_pct", default=0)
+        w_grow = _safe_get(fi, "growth_path", "weight_pct", default=0)
+        if any(isinstance(w, (int, float)) and w > 0 for w in [w_lead, w_moti, w_grow]):
+            print(f"\n  FACTOR WEIGHTS")
+            print(f"    Leadership {w_lead}%  |  Motivation {w_moti}%  |  Growth {w_grow}%")
+
+        # ── Evidence quotes ───────────────────────────────────────────────
+        quotes = ev.get("highlighted_quotes", [])
+        if quotes:
+            print(f"\n  EVIDENCE")
+            for q in quotes[:3]:
+                q_s = str(q)[:68]
+                print(f'    › "{q_s}"')
+
+        # ── AI red flags ──────────────────────────────────────────────────
+        flags = [f for f in ev.get("ai_red_flags", []) if f]
+        if flags:
+            print(f"\n  AI RED FLAGS")
+            for fl in flags[:2]:
+                print(f"    ⚑ {str(fl)[:68]}")
+
+        # ── Summary ───────────────────────────────────────────────────────
+        explanation = a.get("explanation", "")
+        if explanation:
+            print(f"\n  SUMMARY")
+            words, lines, cur = explanation.split(), [], ""
+            for w in words:
+                if len(cur) + len(w) + 1 <= 70:
+                    cur = f"{cur} {w}" if cur else w
+                else:
+                    lines.append(cur)
+                    cur = w
+            if cur:
+                lines.append(cur)
+            for ln in lines[:4]:
+                print(f"    {ln}")
+
+        # ── Fairness warning ──────────────────────────────────────────────
+        fw = a.get("fairness_warning", {})
+        if "⚠️" in fw.get("status", ""):
+            kw = fw.get("flagged_keywords", [])
+            print(f"\n  ⚠️  BIAS DETECTED: {', '.join(kw)}")
+
+    print(f"\n  {'━' * 74}\n")
+
+
 def print_summary_table(results: list):
     """Выводит итоговую сводную таблицу всех кандидатов по завершении."""
     print(f"\n\n{'━' * 80}")
@@ -129,6 +261,9 @@ def process_candidates():
 
     # Выводим сводную таблицу
     print_summary_table(final_results)
+
+    # Выводим детальные explainability-карточки
+    print_explainability_cards(final_results)
 
     # Сохраняем результаты
     output_file = 'final_results.json'

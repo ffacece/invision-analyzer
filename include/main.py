@@ -1,3 +1,5 @@
+import hashlib
+import time
 import json
 import re
 import os
@@ -31,6 +33,9 @@ class CandidateAnalyzer:
             "llama-3.3-70b-versatile",
             "llama3-8b-8192",
         ]
+
+        # Кэш: md5(safe_text) → готовый результат анализа
+        self._cache: dict = {}
 
         # ────────────────────────────────────────────
         # NATASHA NER
@@ -79,7 +84,7 @@ class CandidateAnalyzer:
         self.geo_suffix_pattern = re.compile(
             r'\b[А-ЯЁ][а-яё]+'
             r'(?:ск[еуом]?|град[еуом]?|бург[еуом]?|горск[еуом]?'
-            r'|абад[еуом]?|��поль|ополе|ополем)'
+            r'|абад[еуом]?|ополь|ополе|ополем)'
             r'\b'
         )
 
@@ -91,7 +96,7 @@ class CandidateAnalyzer:
         # Возраст: «мне 17 лет», «22-летний», «1998 года рождения»
         self.age_pattern = re.compile(
             r'\b(?:мне|мой возраст|возраст)\s*[-—]?\s*\d{1,2}\s*(?:лет|год[а-я]*)'
-            r'|\b\d{1,2}[-\s]?л��т(?:ний|няя|нее|них|нем|ней|нюю)?'
+            r'|\b\d{1,2}[-\s]?лет(?:ний|няя|нее|них|нем|ней|нюю)?'
             r'|\b(?:родил(?:ся|ась)\s+в\s+)?\d{4}\s*(?:года?\s*рождения|г\.?\s*р\.?)'
             r'|\b(?:мне\s+)?\d{1,2}\b(?=\s*,?\s*(?:и я|учусь|работаю|живу))',
             re.IGNORECASE
@@ -101,7 +106,7 @@ class CandidateAnalyzer:
         self.gender_pattern = re.compile(
             r'\b(?:я\s+)?(?:парень|девушка|мужчина|женщина|юноша|девочка|мальчик)'
             r'|\b(?:как|будучи|являясь)\s+(?:парн[еюям]|девушк[еойи]|мужчин[аеойы]|женщин[аеойы])'
-            r'|\b(?:мой|моя|��оё)\s+(?:муж|жена|супруг[аи]?)',
+            r'|\b(?:мой|моя|моё)\s+(?:муж|жена|супруг[аи]?)',
             re.IGNORECASE
         )
 
@@ -163,7 +168,7 @@ class CandidateAnalyzer:
         # ────────────────────────────────────────────
         self.golden_standards = [
             {
-                "aspect": "Идеальный пройденный путь и лидерство",
+                "aspect": "Сильный кандидат — конкретика и инициатива",
                 "example": (
                     "Я самостоятельно изучил Python в ауле, организовал "
                     "IT-клуб для 15 подростков. Мы собрали дронов из запчастей "
@@ -171,9 +176,33 @@ class CandidateAnalyzer:
                 ),
                 "strength": (
                     "Конкретика, инициатива в условиях дефицита ресурсов, "
-                    "отсутствие клише."
+                    "отсутствие клише. Leadership ≥ 0.85, Growth ≥ 0.85."
                 ),
-            }
+            },
+            {
+                "aspect": "Средний кандидат — есть опыт, мало конкретики",
+                "example": (
+                    "Я участвовал в хакатоне и наша команда заняла 2-е место. "
+                    "Это научило меня работать в команде. Хочу развиваться "
+                    "в сфере технологий."
+                ),
+                "strength": (
+                    "Есть реальный опыт, но без деталей личного вклада и масштаба. "
+                    "Клише преобладают. Leadership 0.40–0.55, Growth 0.40–0.55."
+                ),
+            },
+            {
+                "aspect": "Слабый кандидат — декларации без фактов",
+                "example": (
+                    "Я считаю себя высокомотивированным индивидом с глубоким "
+                    "пониманием технологических трендов. Моя цель — синергия "
+                    "с инновационной средой. Уверен, что мой вклад будет неоценим."
+                ),
+                "strength": (
+                    "Ноль конкретных фактов. Корпоративные клише без единого "
+                    "реального действия. Leadership ≤ 0.20, Motivation ≤ 0.25."
+                ),
+            },
         ]
 
     # ════════════════════════════════════════════════
@@ -235,6 +264,58 @@ class CandidateAnalyzer:
         return text
 
     # ════════════════════════════════════════════════
+    # ОФЛАЙН-ПРИЗНАКИ ТЕКСТА
+    # ════════════════════════════════════════════════
+
+    def _extract_text_features(self, text: str) -> dict:
+        """
+        Вычисляет лингвистические признаки локально, до вызова LLM.
+        Результат идёт в промпт как контекст и в итоговый JSON как
+        объяснимое свидетельство.
+        """
+        words = re.findall(r'\b[а-яёa-zA-Z]+\b', text.lower())
+        sentences = [s.strip() for s in re.split(r'[.!?]+', text) if s.strip()]
+
+        word_count     = len(words)
+        sentence_count = max(len(sentences), 1)
+        avg_sent_len   = round(word_count / sentence_count, 1)
+        ttr            = round(len(set(words)) / word_count, 3) if word_count else 0.0
+
+        # Лексические маркеры ИИ-генерации
+        AI_MARKERS = [
+            'безусловно', 'важно отметить', 'в контексте', 'таким образом',
+            'в заключение', 'стоит подчеркнуть', 'синергия', 'кроме того',
+            'также стоит отметить', 'резюмируя', 'следует отметить',
+            'в современном мире', 'трансформация', 'высокомотивированный',
+            'неоценим', 'долгосрочной перспективе', 'реализации потенциала',
+        ]
+        ai_marker_count = sum(1 for m in AI_MARKERS if m in text.lower())
+
+        # Глаголы конкретных действий (признак реального лидерства)
+        INITIATIVE_VERBS = [
+            'организовал', 'создал', 'запустил', 'основал', 'разработал',
+            'провёл', 'провел', 'решил', 'открыл', 'собрал', 'написал',
+            'придумал', 'нашёл', 'нашел', 'построил', 'инициировал',
+            'реализовал', 'объединил', 'привлёк', 'привлек', 'обучил',
+        ]
+        initiative_verb_count = sum(
+            1 for v in INITIATIVE_VERBS if v in text.lower()
+        )
+
+        # Числа как прокси конкретности высказываний
+        number_count = len(re.findall(r'\b\d+\b', text))
+
+        return {
+            "word_count":            word_count,
+            "sentence_count":        sentence_count,
+            "avg_sentence_len":      avg_sent_len,
+            "type_token_ratio":      ttr,
+            "ai_marker_count":       ai_marker_count,
+            "initiative_verb_count": initiative_verb_count,
+            "number_count":          number_count,
+        }
+
+    # ════════════════════════════════════════════════
     # УРОВЕНЬ 3: ВАЛИДАЦИЯ ВЫХОДА НА BIAS
     # ════════════════════════════════════════════════
 
@@ -242,28 +323,38 @@ class CandidateAnalyzer:
     def _validate_fairness(result: dict) -> dict:
         """
         Проверяет, что LLM не упомянула protected attributes
-        в своём объяснении или evidence.
+        в своём объяснении или evidence. Использует точный поиск по словам.
         """
-        bias_keywords = [
-            "пол", "гендер", "мужчина", "женщина", "парень", "девушка",
-            "возраст", "молодой", "старый", "юный",
-            "религи", "мусульман", "христиан", "атеист",
-            "национальност", "этнич", "казах", "русск", "узбек",
-            "инвалид", "овз", "ограниченн",
-            "малообеспеч", "бедн", "богат", "нищ",
-            "замужем", "женат", "разведен", "детей",
-        ]
+        # Регулярное выражение для поиска точных слов (с учетом окончаний)
+        bias_pattern = re.compile(
+            r'\b(?:пол|гендер|мужчин[аеуы]|женщин[аеуы]|парень|парн[яю]|девушк[аеиу]|'
+            r'возраст|молод(?:ой|ая|ые)|стар(?:ый|ая|ые)|юн(?:ый|ая|ые)|'
+            r'религи[яию]|мусульман(?:ин|ка|е)|христиан(?:ин|ка|е)|атеист(?:ка|ы)?|'
+            r'национальност[ьи]|этнич|каза[хш](?:ка|и)?|русск(?:ий|ая|ие)|узбе[кч](?:ка|и)?|'
+            r'инвалид(?:ность|ы)?|овз|ограниченн|'
+            r'малообеспеч|бедн|богат|нищ|'
+            r'замужем|женат|разведен[аы]?|дет(?:ей|и|ям))\b',
+            re.IGNORECASE
+        )
 
-        explanation = result.get("explanation", "").lower()
-        quotes = " ".join(result.get("evidence", {}).get("highlighted_quotes", [])).lower()
-        check_text = explanation + " " + quotes
+        explanation = result.get("explanation", "")
+        quotes = " ".join(result.get("evidence", {}).get("highlighted_quotes", []))
+        check_text = f"{explanation} {quotes}"
 
-        bias_found = [kw for kw in bias_keywords if kw in check_text]
+        # Ищем все совпадения
+        found_matches = bias_pattern.findall(check_text)
+        
+        # Оставляем только уникальные совпадения в нижнем регистре
+        unique_flags = list(set([m.lower() for m in found_matches]))
 
-        if bias_found:
+        # Исключаем ложное срабатывание на слово "пол" если это часть "полгода" (страховка)
+        if "пол" in unique_flags and "полгода" in check_text.lower():
+            unique_flags.remove("пол")
+
+        if unique_flags:
             result["fairness_warning"] = {
                 "status": "⚠️ BIAS DETECTED IN OUTPUT",
-                "flagged_keywords": bias_found,
+                "flagged_keywords": unique_flags,
                 "action": (
                     "Обнаружены упоминания protected attributes в ответе LLM. "
                     "Рекомендуется ручная проверка перед использованием."
@@ -311,6 +402,39 @@ class CandidateAnalyzer:
         return None
 
     # ════════════════════════════════════════════════
+    # НОРМАЛИЗАЦИЯ ОТВЕТА LLM
+    # ════════════════════════════════════════════════
+
+    @staticmethod
+    def _normalize_result(result: dict, text_features: dict) -> dict:
+        """
+        После парсинга JSON от LLM:
+        - зажимает все scores в диапазон [0.0, 1.0]
+        - гарантирует наличие score_breakdown и feature_impact для каждого критерия
+        - прикрепляет локально вычисленные text_features
+        """
+        scores = result.get("scores", {})
+        for key in ("leadership", "motivation", "growth_path", "ai_risk"):
+            v = scores.get(key)
+            if isinstance(v, (int, float)):
+                scores[key] = round(max(0.0, min(1.0, float(v))), 3)
+
+        bd = result.get("score_breakdown") or {}
+        result["score_breakdown"] = bd
+        fi = result.get("feature_impact") or {}
+        result["feature_impact"] = fi
+        for crit in ("leadership", "motivation", "growth_path"):
+            if not isinstance(bd.get(crit), dict):
+                bd[crit] = {"score": scores.get(crit), "reasoning": "N/A"}
+            elif bd[crit].get("score") is None:
+                bd[crit]["score"] = scores.get(crit)
+            if not isinstance(fi.get(crit), dict):
+                fi[crit] = {"key_factor": "N/A", "weight_pct": 0}
+
+        result["text_features"] = text_features
+        return result
+
+    # ════════════════════════════════════════════════
     # ЗАГЛУШКА
     # ════════════════════════════════════════════════
 
@@ -338,9 +462,15 @@ class CandidateAnalyzer:
                 "confidence_percent": 0,
                 "caveats": ["Анализ не был выполнен"],
             },
+            "score_breakdown": {
+                "leadership": {"score": None, "reasoning": "N/A"},
+                "motivation":  {"score": None, "reasoning": "N/A"},
+                "growth_path": {"score": None, "reasoning": "N/A"},
+            },
             "feature_impact": {
-                "main_positive_factor": "N/A",
-                "factor_weight": 0,
+                "leadership": {"key_factor": "N/A", "weight_pct": 0},
+                "motivation":  {"key_factor": "N/A", "weight_pct": 0},
+                "growth_path": {"key_factor": "N/A", "weight_pct": 0},
             },
             "evidence": {
                 "highlighted_quotes": [],
@@ -366,11 +496,19 @@ class CandidateAnalyzer:
         # УРОВЕНЬ 1: Анонимизация + удаление bias ДО отправки в LLM
         safe_text = self.anonymize_text(raw_essay_text)
 
+        # Кэш — не тратим API-вызов на повторно встреченный текст
+        cache_key = hashlib.md5(safe_text.encode("utf-8")).hexdigest()
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+
+        # Офлайн-признаки текста, вычисленные локально ДО отправки в LLM
+        text_features = self._extract_text_features(safe_text)
+
         # УРОВЕНЬ 2: Промпт с явным запретом bias
         prompt = f"""
 Ты — ведущий эксперт-лингвист и член приемной комиссии inVision U.
-Проведи аудит эссе по двум направлениям:
-  A) Детекция ИИ-генерации
+Проведи глубокий аудит эссе по двум направлениям:
+  A) Детекция ИИ-генерации (ТЫ САМ ПРИНИМАЕШЬ РЕШЕНИЕ, сгенерирован текст или нет, опираясь исключительно на лингвистические маркеры)
   B) Оценка лидерского потенциала кандидата
 
 ═══════════════════════════════════════
@@ -396,70 +534,78 @@ class CandidateAnalyzer:
 
 Если в тексте остались такие маркеры — ПОЛНОСТЬЮ ИГНОРИРУЙ их.
 Они НЕ ДОЛЖНЫ влиять на оценку ни в положительную, ни в отрицательную сторону.
-Упоминание трудностей ценно ТОЛЬКО через призму действий кандидата, а не через призму статуса.
+Упоминание трудностей ценно ТОЛЬКО через призму ДЕЙСТВИЙ кандидата, а не через призму статуса.
 
 ═══════════════════════════════════════
 ЗОЛОТЫЕ СТАНДАРТЫ (ЭТАЛОНЫ):
 {json.dumps(self.golden_standards, ensure_ascii=False, indent=2)}
 
 ═══════════════════════════════════════
+📊 АВТОМАТИЧЕСКИ ВЫЧИСЛЕННЫЕ ПРИЗНАКИ ТЕКСТА:
+{json.dumps(text_features, ensure_ascii=False)}
+
+Используй как объективный контекст (не для bias):
+  • word_count < 80 → снижай confidence при детекции ИИ
+  • ai_marker_count ≥ 4 → сильный сигнал ИИ-генерации
+  • initiative_verb_count ≥ 3 → признак реальных действий (leadership ↑)
+  • type_token_ratio < 0.45 → лексическая бедность (часто ИИ-паттерн)
+  • number_count ≥ 3 → присутствует конкретика (specificity ↑)
+
+═══════════════════════════════════════
 A. ЧЕК-ЛИСТ ДЕТЕКЦИИ ИИ (8 КРИТЕРИЕВ)
 
-Оцени каждый критерий от 1 до 10 (1 = типично для человека, 10 = типично для ИИ).
+Оцени каждый критерий от 1 до 10 (1 = живой человек, 10 = 100% ИИ).
 
 1. ЛЕКСИЧЕСКОЕ РАЗНООБРАЗИЕ
    - Маркеры ИИ: «безусловно», «важно отметить», «в контексте», «таким образом», «давайте рассмотрим», «в заключение», «стоит подчеркнуть», «синергия»
-   - Разговорная лексика, сленг, жаргон, диалектизмы
-   - Повторы vs нестандартные слова
+   - Наличие разговорной лексики, живой речи, нестандартных оборотов
 
 2. СТРУКТУРА И ФОРМАТИРОВАНИЕ
    - «Идеальная» структурированность
-   - Одинаковая длина абзацев
-   - Шаблон «введение → тело → заключение» без необходимости
+   - Шаблон «введение → тело → заключение» там, где он не нужен
 
 3. СТИЛИСТИЧЕСКАЯ ОДНОРОДНОСТЬ
-   - Стабильный vs «плавающий» тон
-   - Эмоциональные «всплески» / «провалы»
+   - ИИ держит стабильный, ровный, корпоративный тон. Человек может допускать эмоциональные всплески.
 
 4. ПЕРПЛЕКСИЯ И ПРЕДСКАЗУЕМОСТЬ
-   - Банальность vs неожиданность фраз
-   - Нелинейная логика
-   - Клише и «безопасные» формулировки
+   - Банальность vs неожиданность мыслей. Общие слова без конкретики — признак генерации.
 
 5. ФАКТИЧЕСКИЕ И ЛОГИЧЕСКИЕ ОСОБЕННОСТИ
-   - Фактические неточности ИИ
-   - Хеджирование
-   - Личный опыт, детали, уникальные примеры
+   - Наличие конкретного, уникального личного опыта (ИИ часто избегает деталей и пишет абстрактно).
 
 6. СИНТАКСИЧЕСКИЕ ПАТТЕРНЫ
-   - Разнообразие конструкций
-   - Ошибки, опечатки, незаконченные мысли
-   - Длинные сложноподчинённые предложения
+   - Разнообразие конструкций предложений. Человек пишет более "рвано".
+   - Наличие некоторого количества тире/дефисов. Если в предложении вместо дефиса можно поставить запятую, то скорее всего предложение написано ИИ
 
 7. ПРАГМАТИКА И КОММУНИКАТИВНЫЕ МАРКЕРЫ
-   - «Голос» автора, позиция
-   - Ирония, сарказм, юмор
-   - Обращение к читателю
+   - Чувствуется ли уникальный «голос» автора, позиция, страсть.
 
 8. ПАТТЕРНЫ СВЯЗНОСТИ
-   - Избыточные коннекторы ИИ
-   - Неформальные переходы человека
+   - Избыточные коннекторы ИИ («кроме того», «также стоит отметить») vs неформальные переходы.
+   - Лишний англицизм и использование сленгов/юмора в несмешном виде. Если в предложении употребляются слова, которые в формальной речи не употребляют, то скорее всего предложение написано ИИ
 
 ПРАВИЛА ДЕТЕКЦИИ:
-- Совокупность признаков, не один
-- Человек мог редактировать ИИ-текст или писать «гладко»
-- Короткие тексты (<100 слов) — снижай уверенность
-- Грамотность ≠ искусственность
+- Короткие тексты (<100 слов) — снижай уверенность (confidence_percent) и укажи это в caveats.
+- Эссе может быть гибридным (человек написал основу, ИИ "причесал").
 
 ═══════════════════════════════════════
 B. ОЦЕНКА КАНДИДАТА (0.0 – 1.0)
+Оценивай по принципу "Show, Don't Tell" (Покажи, а не расскажи). Обилие красивых корпоративных слов без реальных, подтверждающих действий, должно получать низкий балл лидерства.
 
-- leadership: инициатива, влияние, организация действий
-- motivation: глубина, искренность, внутренний драйв
-- growth_path: траектория роста, преодоление, конкретные шаги
+- leadership: инициатива, способность вести за собой, брать ответственность в нестандартных ситуациях.
+- motivation: глубина амбиций, искренность, масштаб мышления (влияние на общество).
+- growth_path: способность действовать в условиях ограничений, самостоятельность, решение проблем.
+
+Для каждого из трёх критериев ОБЯЗАТЕЛЬНО заполни поля объяснимости:
+  • score_breakdown[criterion].reasoning — 1 конкретное предложение: ПОЧЕМУ именно такой балл.
+    Ссылайся на конкретный факт или цитату из текста, а не на общие слова.
+  • feature_impact[criterion].key_factor — решающий фактор в ≤8 словах
+    (например: «организовал клуб без ресурсов», «только корпоративные клише»).
+  • feature_impact[criterion].weight_pct — вес этого фактора в решении
+    (число 0–100; сумма по трём критериям должна составлять ≈ 100).
 
 ═══════════════════════════════════════
-ФОРМАТ — ТОЛЬКО валидный JSON, без Markdown:
+ФОРМАТ — ТОЛЬКО валидный JSON, без Markdown и пояснений:
 
 {{
   "scores": {{
@@ -467,6 +613,11 @@ B. ОЦЕНКА КАНДИДАТА (0.0 – 1.0)
     "motivation": 0.0,
     "growth_path": 0.0,
     "ai_risk": 0.0
+  }},
+  "score_breakdown": {{
+    "leadership": {{ "score": 0.0, "reasoning": "1 предложение: конкретная причина балла" }},
+    "motivation":  {{ "score": 0.0, "reasoning": "1 предложение: конкретная причина балла" }},
+    "growth_path": {{ "score": 0.0, "reasoning": "1 предложение: конкретная причина балла" }}
   }},
   "ai_detection": {{
     "criteria_scores": {{
@@ -484,14 +635,15 @@ B. ОЦЕНКА КАНДИДАТА (0.0 – 1.0)
     "caveats": []
   }},
   "feature_impact": {{
-    "main_positive_factor": "",
-    "factor_weight": 0
+    "leadership": {{ "key_factor": "Фактор в ≤8 словах", "weight_pct": 0 }},
+    "motivation":  {{ "key_factor": "Фактор в ≤8 словах", "weight_pct": 0 }},
+    "growth_path": {{ "key_factor": "Фактор в ≤8 словах", "weight_pct": 0 }}
   }},
   "evidence": {{
-    "highlighted_quotes": [],
-    "ai_red_flags": []
+    "highlighted_quotes": ["Цитата 1", "Цитата 2"],
+    "ai_red_flags": ["Красный флаг 1 (если есть)"]
   }},
-  "explanation": "",
+  "explanation": "Краткое, но предельно конкретное обоснование выставленных баллов (до 3 предложений). Опирайся на факты из текста.",
   "ai_risk_level": "Low/Medium/High"
 }}
 
@@ -503,50 +655,63 @@ B. ОЦЕНКА КАНДИДАТА (0.0 – 1.0)
         errors_log = []
 
         for model_id in self.models_priority:
-            try:
-                chat_completion = self.client.chat.completions.create(
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": (
-                                "You are a fair, unbiased evaluator. "
-                                "You judge candidates ONLY by their actions, "
-                                "initiative, and growth — NEVER by demographics. "
-                                "Output ONLY valid JSON. No markdown."
-                            ),
-                        },
-                        {"role": "user", "content": prompt},
-                    ],
-                    model=model_id,
-                    temperature=0.15,
-                    response_format={"type": "json_object"},
-                )
-
-                raw_res = chat_completion.choices[0].message.content
-                result = self._safe_parse_json(raw_res)
-
-                if result is None:
-                    msg = (
-                        f"Модель {model_id} вернула невалидный JSON. "
-                        f"Первые 200 символов: {raw_res[:200]}"
+            for attempt in range(3):
+                try:
+                    chat_completion = self.client.chat.completions.create(
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": (
+                                    "You are a fair, unbiased evaluator. "
+                                    "You judge candidates ONLY by their actions, "
+                                    "initiative, and growth — NEVER by demographics. "
+                                    "Output ONLY valid JSON. No markdown."
+                                ),
+                            },
+                            {"role": "user", "content": prompt},
+                        ],
+                        model=model_id,
+                        temperature=0.15,
+                        response_format={"type": "json_object"},
                     )
-                    print(f"⚠️ {msg}")
-                    errors_log.append(msg)
-                    continue
 
-                result["model_used"] = model_id
-                result["privacy_applied"] = True
+                    raw_res = chat_completion.choices[0].message.content
+                    result = self._safe_parse_json(raw_res)
 
-                # УРОВЕНЬ 3: Валидация выхода на bias
-                result = self._validate_fairness(result)
+                    if result is None:
+                        msg = (
+                            f"Модель {model_id} вернула невалидный JSON. "
+                            f"Первые 200 символов: {raw_res[:200]}"
+                        )
+                        print(f"⚠️ {msg}")
+                        errors_log.append(msg)
+                        break  # к следующей модели
 
-                return result
+                    result["model_used"] = model_id
+                    result["privacy_applied"] = True
 
-            except Exception as e:
-                msg = f"Ошибка на {model_id}: {str(e)}"
-                print(f"⚠️ {msg}")
-                errors_log.append(msg)
-                continue
+                    # Нормализация схемы + прикрепление text_features
+                    result = self._normalize_result(result, text_features)
+
+                    # УРОВЕНЬ 3: Валидация выхода на bias
+                    result = self._validate_fairness(result)
+
+                    # Сохраняем в кэш перед возвратом
+                    self._cache[cache_key] = result
+                    return result
+
+                except Exception as e:
+                    err_str = str(e)
+                    is_rate_limit = (
+                        "429" in err_str
+                        or "rate_limit" in err_str.lower()
+                        or "rate limit" in err_str.lower()
+                    )
+                    if is_rate_limit and attempt < 2:
+                        time.sleep(2 ** attempt)  # 1s, 2s
+                        continue
+                    errors_log.append(f"Ошибка на {model_id}: {err_str}")
+                    break  # к следующей модели
 
         return self._fallback_result(
             "; ".join(errors_log) if errors_log else "Все модели недоступны."
