@@ -46,10 +46,9 @@ invision-analyzer/
 ├── include/
 │   └── main.py            # Класс CandidateAnalyzer: анонимизация, LLM, fairness
 ├── process_candidates.py  # Точка входа: чтение mock_data.json, вывод, сохранение
-├── mock_data.json         # Тестовые эссе кандидатов (9 записей)
+├── mock_data.json         # Тестовые эссе кандидатов (5 записей)
 ├── final_results.json     # Результаты последнего запуска (генерируется автоматически)
-├── requirements.txt       # Зависимости Python
-└── .env                   # API-ключ (не коммитить!)
+└── requirements.txt       # Зависимости Python
 ```
 
 ---
@@ -95,6 +94,8 @@ OPENROUTER_API_KEY=ваш_ключ_от_openrouter
   }
 ]
 ```
+
+<sub>*Детектор ИИ работает лучше всего с английским текстом, и может не поддерживать многоязычье.*</sub>
 
 Поле `name` используется только как идентификатор в выводе и не передаётся в LLM.
 
