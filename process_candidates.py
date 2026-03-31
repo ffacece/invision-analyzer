@@ -74,8 +74,12 @@ def print_explainability_cards(results: list):
             aimc = tf.get("ai_marker_count", "?")
             ivc  = tf.get("initiative_verb_count", "?")
             nc   = tf.get("number_count", "?")
+            hf_ai= tf.get("hf_ai_score", "N/A")
+            
             print(f"    Слов: {wc} | Предл: {sc} | Сред. длина: {asl} | TTR: {ttr}")
             print(f"    ИИ-маркеры: {aimc} | Глаголы действия: {ivc} | Числа: {nc}")
+            if hf_ai != "N/A":
+                print(f"    🤖 HF AI Score: {hf_ai} (HuggingFace Detector)")
         # ── Per-criterion reasoning ───────────────────────────────────────
         print(f"\n  REASONING")
         for label, crit in [
@@ -215,7 +219,7 @@ def process_candidates():
         return
 
     final_results = []
-    print(f"\n📊 Начинаем обработку {total_candidates} эссе через Groq API...\n")
+    print(f"\n📊 Начинаем обработку {total_candidates} эссе через OpenRouter API...\n")
 
     start_time = time.time()
 

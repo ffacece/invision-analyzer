@@ -4,7 +4,7 @@ certifi==2026.2.25
 DAWG-Python==0.7.2
 distro==1.9.0
 docopt==0.6.2
-groq==1.1.2
+groq==1.1.2\nopenai
 h11==0.16.0
 httpcore==1.0.9
 httpx==0.28.1
@@ -26,3 +26,8 @@ sortedcontainers==2.4.0
 typing-inspection==0.4.2
 typing_extensions==4.15.0
 yargy==0.16.0
+
+transformers
+torch
+torchvision
+torchaudio

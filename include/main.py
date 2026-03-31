@@ -3,8 +3,15 @@ import time
 import json
 import re
 import os
-from groq import Groq
+from openai import OpenAI
 from dotenv import load_dotenv
+from transformers import models
+
+try:
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline
+    TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    TRANSFORMERS_AVAILABLE = False
 
 try:
     from natasha import (
@@ -15,23 +22,25 @@ try:
 except ImportError:
     NATASHA_AVAILABLE = False
 
-load_dotenv()
-
+load_dotenv(override=True)
 
 class CandidateAnalyzer:
     def __init__(self):
-        api_key = os.getenv("GROQ_API_KEY")
+        api_key = os.getenv("OPENROUTER_API_KEY")
         if not api_key:
             raise ValueError(
                 "API ключ не найден! Убедитесь, что файл .env существует "
-                "и содержит GROQ_API_KEY."
+                "и содержит OPENROUTER_API_KEY."
             )
 
-        self.client = Groq(api_key=api_key)
+        self.client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=api_key,
+        )
 
         self.models_priority = [
-            "llama-3.3-70b-versatile",
-            "llama3-8b-8192",
+            "meta-llama/llama-3.3-70b-instruct",
+            "meta-llama/llama-3.1-8b-instruct",
         ]
 
         # Кэш: md5(safe_text) → готовый результат анализа
@@ -51,6 +60,26 @@ class CandidateAnalyzer:
                 "⚠️ natasha не установлена (pip install natasha). "
                 "Regex-фолбэк активен."
             )
+
+        # ────────────────────────────────────────────
+        # HUGGINGFACE AI-DETECTION
+        # ────────────────────────────────────────────
+        if TRANSFORMERS_AVAILABLE:
+            model_name = "AICodexLab/answerdotai-ModernBERT-base-ai-detector"
+            print(f"⏳ Загрузка модели детекции ИИ ({model_name})...")
+            try:
+                hf_token = os.getenv("HF_TOKEN")
+                self.ai_tokenizer = AutoTokenizer.from_pretrained(model_name, token=hf_token)
+                self.ai_model = AutoModelForSequenceClassification.from_pretrained(model_name, token=hf_token)
+                self.ai_detector = pipeline("text-classification", model=self.ai_model, tokenizer=self.ai_tokenizer)
+                print("✅ Модель детекции ИИ успешно загружена")
+            except Exception as e:
+                print(f"⚠️ Ошибка при загрузке модели детекции ИИ: {e}")
+                self.ai_detector = None
+        else:
+            self.ai_detector = None
+            print("⚠️ transformers не установлены. HF AI-детектор недоступен.")
+
 
         # ────────────────────────────────────────────
         # REGEX PATTERNS
@@ -264,7 +293,7 @@ class CandidateAnalyzer:
         return text
 
     # ════════════════════════════════════════════════
-    # ОФЛАЙН-ПРИЗНАКИ ТЕКСТА
+        # ОФЛАЙН-ПРИЗНАКИ ТЕКСТА
     # ════════════════════════════════════════════════
 
     def _extract_text_features(self, text: str) -> dict:
@@ -304,6 +333,29 @@ class CandidateAnalyzer:
 
         # Числа как прокси конкретности высказываний
         number_count = len(re.findall(r'\b\d+\b', text))
+        
+        # Детекция ИИ с помощью HuggingFace (если доступно)
+        hf_ai_score = None
+        hf_ai_label = None
+        if hasattr(self, 'ai_detector') and self.ai_detector is not None:
+            # Ограничиваем длину текста для модели
+            try:
+                # В пайплайн передаем текст (до 8000 символов, чтобы влезть в лимит)
+                hf_result = self.ai_detector(text[:8000])
+                if hf_result and len(hf_result) > 0:
+                    hf_ai_label = hf_result[0].get('label')
+                    score = hf_result[0].get('score')
+                    
+                    # Приводим к формату (0.0 = человек, 1.0 = ИИ)
+                    # Если модель возвращает 'LABEL_1' (ИИ) или 'LABEL_0' (человек) - адаптируйте в зависимости от выхода (ModernBERT: 1=ИИ)
+                    if str(hf_ai_label).lower() in ['label_1', 'ai', '1', 'ai-generated']:
+                        hf_ai_score = score
+                    elif str(hf_ai_label).lower() in ['label_0', 'human', '0', 'human-written']:
+                        hf_ai_score = 1.0 - score
+                    else:
+                        hf_ai_score = score # Фоллбэк
+            except Exception as e:
+                print(f"⚠️ Ошибка вызова HuggingFace детектора: {e}")
 
         return {
             "word_count":            word_count,
@@ -313,6 +365,8 @@ class CandidateAnalyzer:
             "ai_marker_count":       ai_marker_count,
             "initiative_verb_count": initiative_verb_count,
             "number_count":          number_count,
+            "hf_ai_score":           round(hf_ai_score, 3) if hf_ai_score is not None else None,
+            "hf_ai_label":           hf_ai_label,
         }
 
     # ════════════════════════════════════════════════
@@ -412,8 +466,23 @@ class CandidateAnalyzer:
         - зажимает все scores в диапазон [0.0, 1.0]
         - гарантирует наличие score_breakdown и feature_impact для каждого критерия
         - прикрепляет локально вычисленные text_features
+        - подменяет ai_risk на оценку от HuggingFace, если она доступна
         """
         scores = result.get("scores", {})
+        
+        # Интеграция HuggingFace детектора:
+        if text_features.get("hf_ai_score") is not None:
+            scores["ai_risk"] = text_features["hf_ai_score"]
+            
+            # Также обновляем ai_risk_level на основании этой оценки
+            risk_val = scores["ai_risk"]
+            if risk_val > 0.7:
+                result["ai_risk_level"] = "High"
+            elif risk_val > 0.3:
+                result["ai_risk_level"] = "Medium"
+            else:
+                result["ai_risk_level"] = "Low"
+                
         for key in ("leadership", "motivation", "growth_path", "ai_risk"):
             v = scores.get(key)
             if isinstance(v, (int, float)):

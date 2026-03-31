@@ -29,7 +29,7 @@
 | Компонент | Описание |
 |-----------|---------|
 | Python 3.14.3 | Язык разработки |
-| [Groq API](https://groq.com) | Инференс LLM (llama-3.3-70b-versatile / llama3-8b-8192) |
+| [OpenRouter API](https://openrouter.ai) | Инференс LLM (meta-llama/llama-3.3-70b-instruct / llama-3.1-8b-instruct) |
 | natasha | NER-анонимизация имён, локаций, организаций (опционально) |
 | pymorphy2 | Морфологический анализ для regex-фолбэка |
 | python-dotenv | Загрузка API-ключа из `.env` |
@@ -77,10 +77,10 @@ pip install natasha
 Создайте файл `.env` в корне проекта:
 
 ```env
-GROQ_API_KEY=ваш_ключ_от_groq
+OPENROUTER_API_KEY=ваш_ключ_от_openrouter
 ```
 
-Получить бесплатный ключ можно на [console.groq.com](https://console.groq.com).
+Получить ключ можно на [openrouter.ai/keys](https://openrouter.ai/keys).
 
 ### 3. Подготовка данных
 
